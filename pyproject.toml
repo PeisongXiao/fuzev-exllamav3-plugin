@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fuzev-exllamav3-plugin"
+dynamic = ["version"]
+description = "FuZev generation and decisions for ExLlamaV3"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{name = "Peisong Xiao"}]
+dependencies = ["fuzev-runtime>=1.0,<2", "pydantic>=2.5", "torch", "pillow>=9.1", "fastapi>=0.115", "uvicorn>=0.30", "transformers>=4.57"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "httpx>=0.28", "jinja2>=3", "typesafe-sdk>=0.6", "safetensors>=0.5"]
+
+[project.scripts]
+fuzev-native = "fuzev_exllamav3.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["gpu: opt-in checks against an already running GPU-backed service"]
