@@ -26,44 +26,29 @@ from conftest import decision, job_text
 ])
 def test_chat_reasoning(text, thinking, expected):
     assert chat_message(text, thinking=thinking) == expected
-
-
-@pytest.mark.parametrize("text,thinking", [
-    (" analysis \n</think>\n answer ", True),
-    ("<think>unfinished", True),
-    ("<think></think>", True),
-    (" plain answer ", False),
-])
-def test_native_reasoning_matches_upstream_qwen3_golden(text, thinking):
-    from types import SimpleNamespace
-    pytest.importorskip("vllm")
-    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-    from vllm.reasoning import ReasoningParserManager
-
-    tokenizer = SimpleNamespace(get_vocab=lambda: {"<think>": 1, "</think>": 2, "<tool_call>": 3, "</tool_call>": 4})
-    options = {"enable_thinking": thinking}
-    parser = ReasoningParserManager.get_reasoning_parser("qwen3")(tokenizer, chat_template_kwargs=options)
-    parser.adjust_initial_state_from_prompt([])
-    request = ChatCompletionRequest(model="test", messages=[{"role": "user", "content": "Question"}],
-                                    chat_template_kwargs=options)
-    reasoning, content = parser.extract_reasoning(text, request)
-    assert chat_message(text, thinking=thinking) == {"role": "assistant", "content": content, "reasoning": reasoning}
     splitter = ReasoningSplitter(thinking=thinking)
     parts = [part for char in text for part in splitter.feed(char)] + splitter.feed("", final=True)
-    assert ("".join(part.get("reasoning", "") for part in parts) or None) == reasoning
-    assert ("".join(part.get("content", "") for part in parts) or None) == content
+    assert ("".join(part.get("reasoning", "") for part in parts) or None) == expected["reasoning"]
+    assert ("".join(part.get("content", "") for part in parts) or None) == expected["content"]
 
 
 def test_real_head_golden_and_compact_decision(native):
     service, owner = native
     result = asyncio.run(service.decide(ServiceDecisionRequest(**decision()), request_id="direct"))
+    assert result["head_id"] == "test-head"
     assert result["selected_id"] == "yes"
     assert result["calibration_id"] == "calibrated"
     assert [row["logit"] for row in result["scores"]] == [2.0, 0.0]
     assert [row["raw_probability"] for row in result["scores"]] == pytest.approx([0.880797078, 0.119202922])
     assert [row["calibrated_probability"] for row in result["scores"]] == pytest.approx([0.731058579, 0.268941421])
     assert set(result) == {"id", "model", "primitive", "head_id", "calibration_id", "selected_id", "scores", "execution"}
-    assert result["execution"] == {"submitted_tokens": sum(job.input_ids.numel() for job in owner.completed)}
+    assert result["execution"] == {
+        "input_tokens": sum(job.input_ids.numel() for job in owner.completed)
+                        - 2 * owner.completed[0].input_ids.numel(),
+        "submitted_tokens": sum(job.input_ids.numel() for job in owner.completed),
+        "cached_tokens": sum(job.cached_tokens for job in owner.completed),
+        "forwarded_tokens": sum(job.forwarded_tokens for job in owner.completed),
+        "completed_root_branches": sum(job.readout_root is not None for job in owner.completed)}
     assert owner.jobs == {"external-generation"}
     repeated = asyncio.run(service.decide(ServiceDecisionRequest(**decision())))
     assert repeated["scores"] == result["scores"]

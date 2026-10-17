@@ -2,13 +2,19 @@
 
 from copy import deepcopy
 
-from fuzev.encoding import TEMPLATE
+from fuzev.encoding import LIST_AWARE_VERSION, TEMPLATE, TEMPLATE_KWARGS, VERSION, list_aware_query_suffix, query_suffix
 
 
 class ReadoutPreparer:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, encoding_version=VERSION):
+        if encoding_version not in (VERSION, LIST_AWARE_VERSION):
+            raise ValueError(f"Unsupported decision encoding: {encoding_version}; supported: {VERSION}, {LIST_AWARE_VERSION}")
         self.tokenizer = tokenizer
         self.template = TEMPLATE.read_text()
+
+    def query_suffix(self, question, candidates, additional_context="", *, route="labelled"):
+        suffix = list_aware_query_suffix if route == "label_free" else query_suffix
+        return suffix(question, candidates, additional_context)
 
     def encode(self, text, embeddings=None):
         return tuple(self.tokenizer.encode(
@@ -24,7 +30,7 @@ class ReadoutPreparer:
             user["content"] = [{"type": "image"}, {"type": "text", "text": user["content"]}]
         return self.tokenizer.hf_render_chat_template(
             context, add_generation_prompt=False, chat_template=self.template,
-            enable_thinking=False, reasoning_effort="none", preserve_thinking=True)
+            **TEMPLATE_KWARGS)
 
     def base(self, messages):
         return self.encode(self.render(messages))

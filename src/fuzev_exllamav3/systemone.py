@@ -2,6 +2,7 @@
 
 import asyncio
 import secrets
+from uuid import uuid4
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -43,7 +44,7 @@ class ServiceRoutes:
             raise APIError(409, "Request ID is already active")
 
     async def _drain(self, key, task):
-        if not task.done():
+        if not task.done() and not task.cancelling():
             task.cancel()
         drain = asyncio.gather(task, return_exceptions=True)
         while not drain.done():
@@ -55,7 +56,7 @@ class ServiceRoutes:
             self.tasks.pop(key, None)
 
     async def respond(self, http, operation, *, status_code=200, schema=None):
-        key = request_id({})
+        key = "req_" + uuid4().hex
         task = None
         try:
             key = getattr(http.state, "request_id", None) or request_id(http.headers)
@@ -80,59 +81,60 @@ class ServiceRoutes:
                 await self._drain(key, task)
 
     async def stream(self, http, iterator, key):
-        queue = asyncio.Queue(maxsize=1)
         end = object()
+        reader = None
 
-        async def produce():
+        async def close_on_cancel():
             try:
-                async for chunk in iterator:
-                    await queue.put(chunk)
+                # Keep cancellation live while StreamingResponse is sending a chunk.
+                await asyncio.Future()
             finally:
+                if reader is not None:
+                    await self._drain(key, reader)
                 await iterator.aclose()
 
-        producer = asyncio.create_task(produce())
-        self.tasks[key] = producer
+        lifetime = asyncio.create_task(close_on_cancel())
+        self.tasks[key] = lifetime
 
         async def next_chunk():
-            receive = asyncio.create_task(queue.get())
-            try:
-                await asyncio.wait({receive, producer}, return_when=asyncio.FIRST_COMPLETED)
-                if receive.done():
-                    return receive.result()
-                try:
-                    producer.result()
-                except (Exception, asyncio.CancelledError) as error:
-                    return error
-                return end
-            finally:
-                if not receive.done():
-                    receive.cancel()
-                await asyncio.gather(receive, return_exceptions=True)
+            nonlocal reader
+            if lifetime.cancelling():
+                raise asyncio.CancelledError
+            reader = asyncio.create_task(anext(iterator, end))
+            return await reader
 
         first_task = asyncio.create_task(next_chunk())
         try:
             if not await finished_before_disconnect(http, first_task):
                 raise APIError(499, "Client disconnected")
             first = await first_task
-            if isinstance(first, BaseException):
-                raise first
         except BaseException:
-            first_task.cancel()
-            await asyncio.gather(first_task, return_exceptions=True)
-            await self._drain(key, producer)
+            await self._drain(key, first_task)
+            await self._drain(key, lifetime)
             raise
 
         async def body():
-            chunk = first
-            while chunk is not end:
-                if isinstance(chunk, BaseException):
-                    yield stream_error(chunk)
-                    break
-                yield sse_event(chunk)
-                chunk = await next_chunk()
-            yield sse_event("[DONE]")
+            try:
+                chunk = first
+                try:
+                    while chunk is not end:
+                        yield sse_event(chunk)
+                        chunk = await next_chunk()
+                except (Exception, asyncio.CancelledError) as error:
+                    yield stream_error(error)
+                yield sse_event("[DONE]")
+            finally:
+                await self._drain(key, lifetime)
 
-        return GenerationStream(body(), lambda: self._drain(key, producer), media_type="text/event-stream",
+        content = body()
+
+        async def cleanup():
+            try:
+                await self._drain(key, lifetime)
+            finally:
+                await content.aclose()
+
+        return GenerationStream(content, cleanup, media_type="text/event-stream",
                                 headers={HEADER: key, "Cache-Control": "no-cache"})
 
     async def close(self):
@@ -167,8 +169,7 @@ def add_systemone_routes(app, get_service, *, include_models=False, api_key=None
             service.decide, model_name=service.model_name,
             token_count=lambda text: service.tokenizer.encode(
                 text, encode_special_tokens=False).shape[-1],
-            head_id=service.head.head_id, max_options=service.head.max_options,
-            primitives=service.head.primitives,
+            head_id=service.head.head_id,
         )
         @app.post("/v1/systemone")
         async def systemone(http: Request):

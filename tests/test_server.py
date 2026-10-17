@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -124,9 +125,27 @@ def test_omitted_generation_limit_respects_advertised_context(native, monkeypatc
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("extra", [[], ["--mtp-tokens", "3", "--cache-bits", "8", "8", "--max-batch-size", "7"]])
-def test_launcher_uses_one_generator_and_closes_its_models(native, monkeypatch, extra):
+@pytest.mark.parametrize("profile_arg,chunk_args,expected_chunk,extra", [
+    (None, [], 512, []),
+    ('{"prefill_chunk": 1024}', ["--max-chunk-size", "256"], 256, []),
+    ('{"prefill_chunk": 1024}', [], 1024, []),
+    ("file", [], 1024, []),
+    (None, [], 512, ["--mtp-tokens", "3", "--cache-bits", "8", "8", "--max-batch-size", "7"]),
+    ('{"prefill_chunk": 4096}', [], 1536, []),
+])
+def test_launcher_uses_one_generator_and_closes_its_models(native, monkeypatch, tmp_path, extra,
+                                                          profile_arg, chunk_args, expected_chunk):
     service, owner = native
+    profile = {"prefill_chunk": 512}
+    if profile_arg == "file":
+        profile_path = tmp_path / "prefill.json"
+        profile_path.write_text(json.dumps({"prefill_chunk": 1024}))
+        profile_arg = str(profile_path)
+    profile_args = ["--prefill-profile", profile_arg] if profile_arg is not None else []
+    args = parser().parse_args([
+        "--model", "local-model", "--model-name", "test-model", "--head", str(service.bundle_directory),
+        "--head-device", "cpu", "--cache-tokens", "1300", "--chat-template-kwargs", '{"enable_thinking": false}',
+        *extra, *profile_args, *chunk_args])
     models = []
     class Model:
         def __init__(self):
@@ -136,11 +155,13 @@ def test_launcher_uses_one_generator_and_closes_its_models(native, monkeypatch, 
             model = cls()
             models.append(model)
             return model
-        def load(self, **kwargs):
+        def load(self, *, max_chunk_size, **kwargs):
+            self.prefill_capacity = max_chunk_size
             self.loaded = True
         def unload(self):
             self.unloaded = True
     config = owner.generator.model.config
+    monkeypatch.setattr(config, "infer_params", SimpleNamespace(prefill_optimizations=True), raising=False)
     engine = sys.modules["exllamav3"]
     engine.Config = SimpleNamespace(from_directory=lambda path: config)
     engine.Model = Model
@@ -152,16 +173,18 @@ def test_launcher_uses_one_generator_and_closes_its_models(native, monkeypatch, 
         return value
     engine.Cache = cache
     created = []
-    def generator(**kwargs):
+    def generator(max_chunk_size=128, **kwargs):
         created.append(kwargs)
+        owner.generator.max_chunk_size = max_chunk_size
         owner.generator.max_total_tokens = kwargs["cache"].max_num_tokens
         owner.generator.num_draft_tokens = kwargs.get("num_draft_tokens", 0)
         return owner
+    engine.Generator = generator
     monkeypatch.setattr(sys.modules["exllamav3.generator.async_generator"], "AsyncGenerator", generator, raising=False)
     for name, members in {"exllamav3.cache": {"CacheLayer_quant": object()},
                           "exllamav3.constants": {"PAGE_SIZE": 256},
-                          "exllamav3.optimized": {},
-                          "exllamav3.optimized.install": {"INSTALLED": True}}.items():
+                          "exllamav3.optimized": {"settings": SimpleNamespace(CONFIG=profile),
+                                                 "enable_prefill_optimizations": profile.update}}.items():
         module = ModuleType(name)
         module.__dict__.update(members)
         monkeypatch.setitem(sys.modules, name, module)
@@ -189,13 +212,12 @@ def test_launcher_uses_one_generator_and_closes_its_models(native, monkeypatch, 
                 assert (await pending).status_code == 499
     uvicorn.Server = Server
     monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
-    asyncio.run(serve(parser().parse_args([
-        "--model", "local-model", "--model-name", "test-model", "--head", str(service.bundle_directory),
-        "--head-device", "cpu", "--cache-tokens", "1300", "--chat-template-kwargs", '{"enable_thinking": false}', *extra])))
+    asyncio.run(serve(args))
     assert len(created) == 1
     assert all(cache.max_num_tokens % 256 == 0 and cache.max_num_tokens >= 1300 for cache in caches)
     assert owner.closed and all(model.loaded and model.unloaded for model in models)
-    assert created[0]["max_chunk_size"] == 8192
+    assert all(model.prefill_capacity == expected_chunk for model in models)
+    assert owner.generator.max_chunk_size == expected_chunk
 
 
 def test_generation_accepts_common_openai_fields_and_model_alias(native):

@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 
@@ -78,20 +79,25 @@ def parser():
     cli.add_argument("--head", help="Decision head bundle; omit for generation only")
     cli.add_argument("--head-device", help="Device for the decision head; default: available CUDA device or CPU")
     cli.add_argument("--chat-template-kwargs", type=json.loads, default={}, help="JSON object of chat template defaults")
-    cli.add_argument("--calibration", choices=("raw", "calibrated"), default="raw")
-    cli.add_argument("--host", default="127.0.0.1")
-    cli.add_argument("--port", type=int, default=8000)
+    cli.add_argument("--calibration", choices=("raw", "calibrated"), default="raw",
+                     help="Probability mode; requests without matching calibration use raw probabilities (default: raw)")
+    cli.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    cli.add_argument("--port", type=int, default=8000, help="Listen port (default: 8000)")
     cli.add_argument("--api-key", help="Require this bearer token on /v1 routes")
     cli.add_argument("--max-request-bytes", type=int, help="Maximum request body size in bytes (default 8 MiB)")
     cli.add_argument("--context-length", type=int, help="Context window; default: model and cache budget")
     cli.add_argument("--cache-tokens", type=int, help="Total cache tokens, rounded up to a page multiple; default: one context")
     cli.add_argument("--cache-bits", nargs=2, type=int, metavar=("K", "V"), help="Quantized KV cache bit widths")
-    cli.add_argument("--max-batch-size", type=int, help="Engine batch size; default: cache setting")
-    cli.add_argument("--max-chunk-size", type=int, default=8192,
-                     help="Prefill chunk tokens (default 8192, the chunk the prefill optimizations are measured with; lower it if prefill runs out of memory)")
+    cli.add_argument("--max-batch-size", type=int, help="Engine batch size (default 16)")
+    cli.add_argument("--prefill-profile", help="Prefill profile keys as a JSON object or JSON file path")
+    cli.add_argument("--max-chunk-size", type=int,
+                     help="Prefill chunk tokens, a multiple of 256 and at most the cache tokens; default: the "
+                          "prefill profile's prefill_chunk (32,768), capped at the cache tokens. "
+                          "Lower it if loading or prefill runs out of memory.")
     cli.add_argument("--use-vram", nargs="+", type=float, help="VRAM in GiB per device; default: engine allocation")
     cli.add_argument("--mtp-tokens", type=int, help="Enable the model's MTP component with this draft length")
-    cli.add_argument("--vision", action="store_true", help="Load the model's vision component for image inputs")
+    cli.add_argument("--vision", action="store_true",
+                     help="Load the model's vision component for experimental image inputs")
     cli.add_argument("--prefix-capacity", type=int, default=DEFAULT_PREFIX_CAPACITY,
                      help=f"Retained prefixes with LRU eviction (default: {DEFAULT_PREFIX_CAPACITY})")
     return cli
@@ -108,24 +114,36 @@ async def serve(args):
 
     require_fork()
 
+    from exllamav3.optimized import settings
+
+    if args.prefill_profile is not None:
+        from exllamav3.optimized import enable_prefill_optimizations
+
+        profile = args.prefill_profile
+        if not profile.lstrip().startswith("{"):
+            profile = Path(profile).read_text()
+        enable_prefill_optimizations(json.loads(profile))
     config = Config.from_directory(args.model)
     context = args.context_length or config.max_position_embeddings
     cache_tokens = ((args.cache_tokens or context) + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+    max_chunk_size = min(settings.CONFIG["prefill_chunk"], cache_tokens) if args.max_chunk_size is None else args.max_chunk_size
     cache_options, load_options, generator_options = {}, {}, {}
     if args.cache_bits is not None:
         cache_options.update(layer_type=CacheLayer_quant, k_bits=args.cache_bits[0], v_bits=args.cache_bits[1])
     if args.max_batch_size is not None:
         cache_options["max_batch_size"] = args.max_batch_size
         generator_options["max_batch_size"] = args.max_batch_size
-    load_options["max_chunk_size"] = generator_options["max_chunk_size"] = args.max_chunk_size
+    load_options["max_chunk_size"] = generator_options["max_chunk_size"] = max_chunk_size
     if args.use_vram is not None:
         load_options["use_per_device"] = args.use_vram
     models, engine, service, app = [], None, None, None
     try:
         model = Model.from_config(config)
         models.append(model)
-        from exllamav3.optimized.install import INSTALLED
-        print(f"Prefill optimizations {'enabled' if INSTALLED else 'disabled'}; chunk size {args.max_chunk_size} tokens", flush=True)
+        print(f"Prefill optimizations {'enabled' if config.infer_params.prefill_optimizations else 'disabled'}; "
+              f"prefill chunk {max_chunk_size} tokens"
+              + (f"; profile {json.dumps(settings.CONFIG)}" if config.infer_params.prefill_optimizations else ""),
+              flush=True)
         cache = Cache(model, max_num_tokens=cache_tokens, max_history=args.mtp_tokens or 0, **cache_options)
         generator_options["max_batch_size"] = cache.num_slots
         load_options["max_batch_size"] = cache.num_slots

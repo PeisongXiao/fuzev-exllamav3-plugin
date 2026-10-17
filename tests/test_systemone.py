@@ -7,7 +7,9 @@ import httpx
 import pytest
 
 from fuzev.api import models_response
+from fuzev.encoding import candidate_suffix
 from fuzev.service_contracts import ServiceDecisionRequest
+from fuzev.systemone import SystemOneRequest, decision_request, state_text
 from fuzev_exllamav3.server import create_app
 from fuzev_exllamav3.generator_service import build_generator_service
 from fuzev_exllamav3.systemone import HEADER, add_systemone_routes
@@ -17,6 +19,20 @@ from test_generator_service import image_input
 
 def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture")
+
+
+def encoded_input_tokens(service, payload):
+    request = SystemOneRequest.model_validate(payload)
+    state = state_text(request.state)
+    total = 0
+    for index, question in enumerate(request.questions.values()):
+        decision = decision_request(request, question, service.model_name, service.head.head_id, state)
+        if index == 0:
+            total += len(service.preparer.base(decision.messages))
+        candidates = [candidate.model_dump() for candidate in decision.candidates]
+        total += len(service.preparer.encode(service.preparer.query_suffix(decision.question, candidates, "")))
+        total += sum(len(service.preparer.encode(candidate_suffix(candidate))) for candidate in candidates)
+    return total
 
 
 def test_three_primitives_match_direct_service_and_evaluated_rendering(native):
@@ -40,7 +56,7 @@ def test_three_primitives_match_direct_service_and_evaluated_rendering(native):
         assert any("(A) Yes: Duplicate\n(B) No: Not duplicate" in text for text in queries)
         assert all("Question: \nCandidates:" in text for text in queries)
         assert all("message: Charged twice\nhistory:\n  - paid\n  - paid" in text for text in queries)
-        assert result["usage"]["input_tokens"] == sum(job.input_ids.numel() for job in owner.completed)
+        assert result["usage"]["input_tokens"] == encoded_input_tokens(service, body())
         assert owner.jobs == {"external-generation"}
     asyncio.run(run())
 
@@ -165,6 +181,10 @@ def test_existing_application_routes_remain_unchanged(native):
         async with client(app) as http:
             assert (await http.post("/v1/completions", headers={HEADER: "invalid id"})).json() == {"original": True}
             assert (await http.get("/v1/models")).json()["models"][0]["release_date"] == "2026-10-12"
+            invalid = await http.post("/v1/systemone", json=body(), headers={HEADER: "invalid id"})
+            assert invalid.status_code == 422
+            assert invalid.headers[HEADER].startswith("req_")
+            assert invalid.json()["detail"][0]["loc"] == ["header", "x-typesafe-request-id"]
         assert not service.closed and not owner.closed
     asyncio.run(run())
 
@@ -232,7 +252,7 @@ def test_shared_state_preserves_long_state_golden_answers(native):
             else:
                 assert list(answer["probabilities"].values()) == [
                     row["calibrated_probability"] for row in direct[key]["scores"]]
-        assert result["usage"]["input_tokens"] == sum(job.input_ids.numel() for job in engine.completed)
+        assert result["usage"]["input_tokens"] == encoded_input_tokens(service, payload)
     asyncio.run(run())
 
 
@@ -256,7 +276,11 @@ def test_real_sdk_cpu_integration(native):
             assert result.choices["pick"].choice == "refund"
             assert result.nouls["check"].noul == pytest.approx(0.731058579)
             assert result.scores["rank"].legend == {0: {"level": "low"}, 1: {"level": "high"}}
-            assert result.usage.input_tokens == sum(job.input_ids.numel() for job in owner.completed)
+            expected = body(questions={
+                "pick": {"type": "choice", "criteria": {"refund": "Return funds", "wait": "Wait"}},
+                "check": {"type": "noul", "instructions": "Was the customer charged twice?"},
+                "rank": {"type": "score", "criteria": [{"level": "low"}, {"level": "high"}]}})
+            assert result.usage.input_tokens == encoded_input_tokens(service, expected)
         assert not owner.closed and owner.jobs == {"external-generation"}
     asyncio.run(run())
 

@@ -67,13 +67,14 @@ def test_nonthinking_chat_stream_content(native):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("disconnect", [True, False], ids=["disconnect", "cancel-route"])
-def test_stream_is_incremental_and_cancellable(native, disconnect):
+@pytest.mark.parametrize("mode", ["disconnect", "disconnect-before-output", "cancel-route", "cancel-during-send"])
+def test_stream_is_incremental_and_cancellable(native, mode):
     service, engine = native
-    engine.chunks, engine.completion = ["early output"], "early output"
+    engine.chunks = [] if mode == "disconnect-before-output" else ["early output"]
+    engine.completion = "early output"
     async def run():
         engine.block = asyncio.Event()
-        queue, output, streamed = asyncio.Queue(), [], asyncio.Event()
+        queue, output, streamed, send_release = asyncio.Queue(), [], asyncio.Event(), asyncio.Event()
         await queue.put({"type": "http.request", "body": json.dumps({"prompt": "Question", "stream": True}).encode(),
                          "more_body": False})
         scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
@@ -84,23 +85,35 @@ def test_stream_is_incremental_and_cancellable(native, disconnect):
             output.append(message)
             if b"early output" in message.get("body", b""):
                 streamed.set()
+                if mode == "cancel-during-send":
+                    await send_release.wait()
         app = create_app(service)
         pending = asyncio.create_task(app(scope, queue.get, send))
-        await streamed.wait()
-        assert output[0]["status"] == 200 and not pending.done()
+        if mode == "disconnect-before-output":
+            await engine.started.wait()
+            assert not output
+        else:
+            await streamed.wait()
+            assert output[0]["status"] == 200 and not pending.done()
         async with client(app) as http:
-            if disconnect:
+            if mode in ("disconnect", "disconnect-before-output"):
                 await queue.put({"type": "http.disconnect"})
             else:
                 cancelled = await http.post("/v1/requests/stream-cancel/cancel")
                 assert cancelled.status_code == 202
+                if mode == "cancel-during-send":
+                    while not engine.cancelled:
+                        await asyncio.sleep(0)
+                    send_release.set()
             await pending
+            if mode == "disconnect-before-output":
+                assert output[0]["status"] == 499
             assert engine.cancelled > 0
             assert (await http.post("/v1/requests/stream-cancel/cancel")).status_code == 404
             engine.block.set()
             assert (await http.post("/v1/completions", json={"prompt": "Next request"})).status_code == 200
         streamed_text = b"".join(message.get("body", b"") for message in output).decode()
-        if not disconnect:
+        if mode in ("cancel-route", "cancel-during-send"):
             chunks = events(streamed_text)
             assert chunks[-2]["error"]["code"] == 499 and chunks[-1] == "[DONE]"
     asyncio.run(asyncio.wait_for(run(), 5))

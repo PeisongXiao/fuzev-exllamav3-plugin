@@ -19,6 +19,14 @@ def test_systemone_on_running_native_service():
         models.raise_for_status()
         response = client.post("/v1/systemone", json={
             "model": models.json()["data"][0]["id"], "state": "The invoice was paid twice.",
-            "questions": {"duplicate": {"type": "noul", "instructions": "Was payment duplicated?"}}})
+            "questions": {
+                "duplicate": {"type": "noul", "instructions": "Was payment duplicated?"},
+                "category": {"type": "choice", "instructions": "Choose the best category.",
+                             "criteria": {str(index): f"Category {index}" for index in range(255)}}}})
     assert response.status_code == 200, response.text
     assert 0 <= response.json()["answers"]["duplicate"]["noul"] <= 1
+    choice = response.json()["answers"]["category"]
+    assert len(choice["probabilities"]) == 255
+    assert all(0 <= value <= 1 for value in choice["probabilities"].values())
+    assert sum(choice["probabilities"].values()) == pytest.approx(1, abs=1e-4)
+    assert choice["choice"] in choice["probabilities"]
